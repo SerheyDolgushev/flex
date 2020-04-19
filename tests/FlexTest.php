@@ -12,6 +12,7 @@
 namespace Symfony\Flex\Tests;
 
 use Composer\Composer;
+use Composer\Config;
 use Composer\DependencyResolver\Operation\InstallOperation;
 use Composer\Factory;
 use Composer\Installer\PackageEvent;
@@ -37,10 +38,6 @@ class FlexTest extends TestCase
 {
     public function testPostInstall()
     {
-        $package = new Package('dummy/dummy', '1.0.0', '1.0.0');
-        $event = $this->getMockBuilder(PackageEvent::class)->disableOriginalConstructor()->getMock();
-        $event->expects($this->any())->method('getOperation')->willReturn(new InstallOperation($package));
-
         $data = [
             'manifests' => [
                 'dummy/dummy' => [
@@ -61,40 +58,14 @@ class FlexTest extends TestCase
             ],
         ];
 
-        $configurator = $this->getMockBuilder(Configurator::class)->disableOriginalConstructor()->getMock();
-        $configurator->expects($this->once())->method('install')->with($this->equalTo(new Recipe($package, 'dummy/dummy', 'install', $data['manifests']['dummy/dummy'], $data['locks']['dummy/dummy'])));
-
-        $downloader = $this->getMockBuilder(Downloader::class)->disableOriginalConstructor()->getMock();
-        $downloader->expects($this->once())->method('getRecipes')->willReturn($data);
-        $downloader->expects($this->once())->method('isEnabled')->willReturn(true);
-
         $io = new BufferIO('', OutputInterface::VERBOSITY_VERBOSE);
-        $locker = $this->getMockBuilder(Locker::class)->disableOriginalConstructor()->getMock();
-        $locker->expects($this->any())->method('getLockData')->willReturn(['content-hash' => 'random']);
+        $package = new Package('dummy/dummy', '1.0.0', '1.0.0');
+        $recipe = new Recipe($package, 'dummy/dummy', 'install', $data['manifests']['dummy/dummy'], $data['locks']['dummy/dummy']);
 
-        $package = $this->getMockBuilder(RootPackageInterface::class)->disableOriginalConstructor()->getMock();
-        $package->expects($this->any())->method('getExtra')->willReturn(['symfony' => ['allow-contrib' => true]]);
-
-        $lock = $this->getMockBuilder(Lock::class)->disableOriginalConstructor()->getMock();
-        $lock->expects($this->any())->method('has')->willReturn(false);
-
-        $flex = \Closure::bind(function () use ($configurator, $downloader, $io, $locker, $package, $lock) {
-            $flex = new Flex();
-            $flex->composer = new Composer();
-            $flex->composer->setLocker($locker);
-            $flex->composer->setPackage($package);
-            $flex->io = $io;
-            $flex->configurator = $configurator;
-            $flex->downloader = $downloader;
-            $flex->runningCommand = function () {
-            };
-            $flex->options = new Options(['config-dir' => 'config', 'var-dir' => 'var']);
-            $flex->lock = $lock;
-
-            return $flex;
-        }, null, Flex::class)->__invoke();
-        $flex->record($event);
-        $flex->install($this->getMockBuilder(Event::class)->disableOriginalConstructor()->getMock());
+        $rootPackage = $this->mockRootPackage(['symfony' => ['allow-contrib' => true]]);
+        $flex = $this->mockFlex($io, $rootPackage, $recipe, $data);
+        $flex->record($this->mockPackageEvent($package));
+        $flex->install($this->mockFlexEvent());
 
         $expected = [
             '',
@@ -124,22 +95,210 @@ EOF
     public function testActivateLoadsClasses()
     {
         $io = new BufferIO('', OutputInterface::VERBOSITY_VERBOSE);
-        $composer = new Composer();
-        $composer->setConfig(Factory::createConfig($io));
-        $package = $this->getMockBuilder(RootPackageInterface::class)->disableOriginalConstructor()->getMock();
-        $package->method('getExtra')->willReturn(['symfony' => ['allow-contrib' => true]]);
+
+        $package = $this->mockRootPackage(['symfony' => ['allow-contrib' => true]]);
         $package->method('getRequires')->willReturn([new Link('dummy', 'symfony/flex')]);
-        $composer->setPackage($package);
-        $localRepo = $this->getMockBuilder(WritableRepositoryInterface::class)->disableOriginalConstructor()->getMock();
-        $manager = $this->getMockBuilder(RepositoryManager::class)->disableOriginalConstructor()->getMock();
-        $manager->expects($this->once())
-            ->method('getLocalRepository')
-            ->willReturn($localRepo);
-        $composer->setRepositoryManager($manager);
+
+        $composer = $this->mockComposer($this->mockLocker(), $package, Factory::createConfig($io));
+        $composer->setRepositoryManager($this->mockManager());
 
         $flex = new Flex();
         $flex->activate($composer, $io);
 
         $this->assertTrue(class_exists(Response::class, false));
+    }
+
+    /**
+     * @dataProvider getPackagesWithExtraBundles
+     */
+    public function testExtraBundles(Package $package, array $expectedManifest, string $expectedExceptionClass = null)
+    {
+        $io = new BufferIO('', OutputInterface::VERBOSITY_VERBOSE);
+
+        $recipe = null;
+        if (\count($expectedManifest)) {
+            $recipe = new Recipe($package, $package->getName(), 'install', $expectedManifest);
+        }
+
+        if ($expectedExceptionClass) {
+            $this->expectException($expectedExceptionClass);
+        }
+
+        $rootPackage = $this->mockRootPackage($package->getExtra());
+        $flex = $this->mockFlex($io, $rootPackage, $recipe, []);
+        $flex->record($this->mockPackageEvent($package));
+        $flex->install($this->mockFlexEvent());
+    }
+
+    public function getPackagesWithExtraBundles(): array
+    {
+        $extraBundle = new Package('dummy/dummy', '1.0.0', '1.0.0');
+        $extraBundle->setExtra(['symfony' => ['bundles' => ['Dummy\Dummy' => ['all']]]]);
+
+        $emptyExtraBundles = new Package('dummy/dummy2', '1.0.0', '1.0.0');
+        $emptyExtraBundles->setExtra(['symfony' => ['bundles' => []]]);
+
+        $noExtraBundle = new Package('symfony/debug-bundle', '1.0.0', '1.0.0');
+        $noExtraBundle->setAutoload(['psr-4' => ['Symfony\\Bundle\\DebugBundle\\' => '']]);
+
+        $invalidExtraBundle = new Package('dummy/dummy3', '1.0.0', '1.0.0');
+        $invalidExtraBundle->setExtra(['symfony' => ['bundles' => 'BundleName']]);
+
+        $invalidExtraBundleEnvs = new Package('dummy/dummy4', '1.0.0', '1.0.0');
+        $invalidExtraBundleEnvs->setExtra(['symfony' => ['bundles' => ['Dummy\Dummy' => 'all']]]);
+
+        $invalidExtraBundleNonStringEnv = new Package('dummy/dummy5', '1.0.0', '1.0.0');
+        $invalidExtraBundleNonStringEnv->setExtra(['symfony' => ['bundles' => ['Dummy\Dummy' => [['all']]]]]);
+
+        return [
+            [
+                $extraBundle,
+                [
+                    'origin' => sprintf('%s:%s@auto-generated recipe', $extraBundle->getName(), $extraBundle->getPrettyVersion()),
+                    'manifest' => [
+                        'bundles' => [
+                            'Dummy\Dummy' => ['all'],
+                        ],
+                    ],
+                ],
+            ],
+            [
+                $emptyExtraBundles,
+                [],
+            ],
+            [
+                $noExtraBundle,
+                [
+                    'origin' => sprintf('%s:%s@auto-generated recipe', $noExtraBundle->getName(), $noExtraBundle->getPrettyVersion()),
+                    'manifest' => [
+                        'bundles' => [
+                            'Symfony\Bundle\DebugBundle\DebugBundle' => ['all'],
+                        ],
+                    ],
+                ],
+            ],
+            [
+                $invalidExtraBundle,
+                [],
+                \InvalidArgumentException::class,
+            ],
+            [
+                $invalidExtraBundleEnvs,
+                [],
+                \InvalidArgumentException::class,
+            ],
+            [
+                $invalidExtraBundleNonStringEnv,
+                [],
+                \InvalidArgumentException::class,
+            ],
+        ];
+    }
+
+    private function mockPackageEvent(Package $package): PackageEvent
+    {
+        $event = $this->getMockBuilder(PackageEvent::class, ['getOperation'])->disableOriginalConstructor()->getMock();
+        $event->expects($this->any())->method('getOperation')->willReturn(new InstallOperation($package));
+
+        return $event;
+    }
+
+    private function mockConfigurator(Recipe $recipe = null): Configurator
+    {
+        $configurator = $this->getMockBuilder(Configurator::class)->disableOriginalConstructor()->getMock();
+
+        if ($recipe) {
+            $configurator->expects($this->once())->method('install')->with($this->equalTo($recipe));
+        }
+
+        return $configurator;
+    }
+
+    private function mockDownloader(array $recipes = []): Downloader
+    {
+        $downloader = $this->getMockBuilder(Downloader::class)->disableOriginalConstructor()->getMock();
+
+        $downloader->expects($this->once())->method('getRecipes')->willReturn($recipes);
+        $downloader->expects($this->once())->method('isEnabled')->willReturn(true);
+
+        return $downloader;
+    }
+
+    private function mockLocker(array $lockData = []): Locker
+    {
+        $locker = $this->getMockBuilder(Locker::class)->disableOriginalConstructor()->getMock();
+
+        $locker->expects($this->any())->method('getLockData')->willReturn(['content-hash' => 'random', 'packages-dev' => []] + $lockData);
+
+        return $locker;
+    }
+
+    private function mockComposer(Locker $locker, RootPackageInterface $package, Config $config = null): Composer
+    {
+        if (null === $config) {
+            $config = $this->getMockBuilder(Config::class)->getMock();
+            $config->expects($this->any())->method('get')->willReturn(__DIR__.'/Fixtures/vendor');
+        }
+
+        $composer = new Composer();
+        $composer->setConfig($config);
+        $composer->setLocker($locker);
+        $composer->setPackage($package);
+
+        return $composer;
+    }
+
+    private function mockRootPackage(array $extraData = []): RootPackageInterface
+    {
+        $package = $this->getMockBuilder(RootPackageInterface::class)->disableOriginalConstructor()->getMock();
+
+        $package->expects($this->any())->method('getExtra')->willReturn($extraData);
+
+        return $package;
+    }
+
+    private function mockLock(): Lock
+    {
+        $lock = $this->getMockBuilder(Lock::class)->disableOriginalConstructor()->getMock();
+        $lock->expects($this->any())->method('has')->willReturn(false);
+
+        return $lock;
+    }
+
+    private function mockFlexEvent(): Event
+    {
+        return $this->getMockBuilder(Event::class)->disableOriginalConstructor()->getMock();
+    }
+
+    private function mockManager(): RepositoryManager
+    {
+        $manager = $this->getMockBuilder(RepositoryManager::class)->disableOriginalConstructor()->getMock();
+
+        $localRepo = $this->getMockBuilder(WritableRepositoryInterface::class)->disableOriginalConstructor()->getMock();
+        $manager->expects($this->once())->method('getLocalRepository')->willReturn($localRepo);
+
+        return $manager;
+    }
+
+    private function mockFlex(BufferIO $io, RootPackageInterface $package, Recipe $recipe = null, array $recipes = []): Flex
+    {
+        $composer = $this->mockComposer($this->mockLocker(), $package);
+        $configurator = $this->mockConfigurator($recipe);
+        $downloader = $this->mockDownloader($recipes);
+        $lock = $this->mockLock();
+
+        return \Closure::bind(function () use ($composer, $io, $configurator, $downloader, $lock) {
+            $flex = new Flex();
+            $flex->composer = $composer;
+            $flex->io = $io;
+            $flex->configurator = $configurator;
+            $flex->downloader = $downloader;
+            $flex->runningCommand = function () {
+            };
+            $flex->options = new Options(['config-dir' => 'config', 'var-dir' => 'var']);
+            $flex->lock = $lock;
+
+            return $flex;
+        }, null, Flex::class)->__invoke();
     }
 }
